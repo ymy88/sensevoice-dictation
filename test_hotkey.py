@@ -80,6 +80,7 @@ main.keyboard.Listener = FakeListener
 main.subprocess.run = lambda *a, **k: type("R", (), {"returncode": 1, "stdout": b""})()
 main.CONFIG = Path(tempfile.mkdtemp()) / "config.json"
 main.print = lambda *a, **k: None
+main.TAIL_SECONDS = 0  # 测试不等真麦克风
 
 
 # ---------- --set-hotkey ----------

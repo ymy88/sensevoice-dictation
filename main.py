@@ -48,6 +48,12 @@ SAMPLE_RATE = 16000
 # 两个以上、只隔一个空格的单个字母。ponytail: 英文句子里的「a」「I」挨着另一个单字母时也会被合并，需要时改成只合并大写字母。
 SPELLED_LETTERS = re.compile(r"(?<![A-Za-z])[A-Za-z](?: [A-Za-z])+(?![A-Za-z])")
 MIN_SECONDS = 0.3  # 短于这个长度多半是误触，识别出来通常是空串或一个语气词
+# 松开快捷键后再录这么久才关麦克风。蓝牙耳机的声音传到电脑有延迟，松开就关的话最后一个字只录到一半，
+# 2026-11-07 的录音里「推送」被识别成「推销」「退缩」。
+TAIL_SECONDS = 0.3
+# 识别前在录音末尾补这么长的静音。X-ASR 认一个字时要用到这个字后面的声音，结尾没有静音时最后一个字常被丢掉。
+# 2026-11-07 用 42 段录音测：不补时「GPU」常变成「gp」；补 0.3 秒能认出来，补 0.5 秒有时会在结尾多出一个词。
+PAD_SECONDS = 0.3
 # 录音里最响的 30ms 片段的 RMS 低于这个值就当没说话。不跳过的话，模型会把静音识别成「Okay.」「.」。
 # 2026-11-07 在 Ghostty + 内置麦克风上实测：环境音最大 0.0012，正常说话中位数 0.05 以上。换麦克风后可能要调。
 SILENCE_RMS = 0.01
@@ -156,7 +162,8 @@ def join_spelled_letters(text: str) -> str:
 
 def transcribe(recognizer: sherpa_onnx.OfflineRecognizer, samples: np.ndarray) -> str:
     stream = recognizer.create_stream()
-    stream.accept_waveform(SAMPLE_RATE, samples)
+    padding = np.zeros(int(SAMPLE_RATE * PAD_SECONDS), dtype=np.float32)
+    stream.accept_waveform(SAMPLE_RATE, np.concatenate([samples, padding]))
     recognizer.decode_stream(stream)
     return join_spelled_letters(stream.result.text.strip())
 
@@ -340,6 +347,7 @@ def main() -> None:
             mic = None
             print("按了组合键，取消录音", flush=True)
         elif event == "up" and mic is not None:
+            time.sleep(TAIL_SECONDS)
             mic.stop()
             mic.close()
             mic = None
