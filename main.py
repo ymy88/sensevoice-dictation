@@ -1,4 +1,4 @@
-"""按住右 Option 说话，松开后用 SenseVoice-Small 在本地识别，把文字打进当前窗口。"""
+"""按住 Insert 说话，松开后用 SenseVoice-Small 在本地识别，把文字打进当前窗口。"""
 
 import subprocess
 import sys
@@ -10,9 +10,11 @@ import numpy as np
 import sherpa_onnx
 import sounddevice as sd
 from pynput import keyboard
+from Quartz import CGEventGetIntegerValueField, kCGKeyboardEventKeycode
 
 MODEL_DIR = Path(__file__).parent / "models" / "sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17"
-HOTKEY = keyboard.Key.alt_r
+# PC 键盘的 Insert 键在 macOS 上发出的是 Help 键的键码 114。
+HOTKEY_VK = 114
 SAMPLE_RATE = 16000
 MIN_SECONDS = 0.3  # 短于这个长度多半是误触，识别出来通常是空串或一个语气词
 
@@ -63,7 +65,7 @@ def main() -> None:
 
     def on_press(key) -> None:
         nonlocal mic
-        if key != HOTKEY or mic is not None:
+        if getattr(key, "vk", None) != HOTKEY_VK or mic is not None:
             return
         chunks.clear()
         # 麦克风只在按住期间打开，菜单栏的橙色麦克风标志也只在这时出现。
@@ -72,7 +74,7 @@ def main() -> None:
 
     def on_release(key) -> None:
         nonlocal mic
-        if key != HOTKEY or mic is None:
+        if getattr(key, "vk", None) != HOTKEY_VK or mic is None:
             return
         mic.stop()
         mic.close()
@@ -85,8 +87,16 @@ def main() -> None:
         # 识别放到别的线程：键盘监听的回调阻塞太久，macOS 会停掉事件监听。
         threading.Thread(target=finish, args=(samples,), daemon=True).start()
 
-    print("按住右 Option 说话，松开后输出文字。Ctrl+C 退出。", flush=True)
-    with keyboard.Listener(on_press=on_press, on_release=on_release) as listener:
+    def swallow_hotkey(event_type, event):
+        # 回调已经处理过这个按键；这里把它拦下，不让当前 App 收到 Insert（终端会把它转成 ESC [2~）。
+        if CGEventGetIntegerValueField(event, kCGKeyboardEventKeycode) == HOTKEY_VK:
+            return None
+        return event
+
+    print("按住 Insert 说话，松开后输出文字。Ctrl+C 退出。", flush=True)
+    with keyboard.Listener(
+        on_press=on_press, on_release=on_release, darwin_intercept=swallow_hotkey
+    ) as listener:
         listener.join()
 
 

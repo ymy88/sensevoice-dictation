@@ -1,6 +1,6 @@
 # sensevoice-dictation
 
-在 macOS 上按住右 Option 说话，松开后用 SenseVoice-Small 在本地把语音转成文字，再粘贴到当前光标位置。支持中英混说，不联网。
+在 macOS 上按住 Insert 说话，松开后用 SenseVoice-Small 在本地把语音转成文字，再粘贴到当前光标位置。支持中英混说，不联网。
 
 ## 安装
 
@@ -21,8 +21,8 @@ uv run python main.py
 第一次运行时，要在「系统设置 → 隐私与安全性」里给运行这个程序的终端 App 打开三项权限：
 
 - 麦克风：录音
-- 输入监控：监听右 Option
-- 辅助功能：发送 Cmd+V
+- 输入监控：监听 Insert 键
+- 辅助功能：发送 Cmd+V，并拦下 Insert 键，不让当前 App 收到
 
 授权后要完全退出终端（Cmd+Q）再重新打开。
 
