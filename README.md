@@ -2,8 +2,6 @@
 
 在 macOS 上按住一个键说话，松开后文字出现在光标位置。语音识别用 [X-ASR](https://github.com/Gilgamesh-J/X-ASR) 在本机完成，不联网。
 
-Hold a key to dictate on macOS. Speech is transcribed locally by X-ASR. Mixed Chinese and English work well.
-
 ## 特点
 
 - **中英混说**：「把这个 component 的 props 改成 optional」这类句子，英文单词保持英文。
