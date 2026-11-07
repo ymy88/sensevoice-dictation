@@ -173,6 +173,38 @@ MR
 
 项目里存在 `recordings/` 目录时，程序把每段录音存成 `recordings/年月日-时分秒.wav`，可以用来比较不同模型的识别结果。删掉这个目录就不再保存。录音只存在本机。
 
+## 为什么用 X-ASR
+
+项目名里的 SenseVoice 是最早用的模型。2026-11-07 起改用 X-ASR，原因是 SenseVoice-Small 在中英混说时错得多，比如把 worktree 听成 work，把 cookie 听成 Q 可。
+
+当天用同一段录音比较了能在 sherpa-onnx 上运行的模型。录音是 28 秒中英混说的技术对话，用蓝牙耳机录制，内容是：
+
+> Logout 修复 MR 484 已经合并进 newUI，提交是 3887。本地 newUI 已经同步，worktree 已清理。现在点 sign out 会发生什么：先调后端 post 接口删掉服务器上的 session，然后才清本地和用户的信息和 token。……
+
+错误率的算法：一个汉字算一个单位，一串连续的英文字母或数字算一个单位，不计空格、标点和大小写。打分前把汉字数字换成阿拉伯数字，所以「三八八七」和「3887」算对。耗时是在 Apple Silicon 上用 4 个线程识别这 28 秒录音的时间。
+
+| 模型 | 体积 | 错误率 | 耗时 |
+|---|--:|--:|--:|
+| **X-ASR（现在用的，带数字转换）** | 175MB | 8.3% | 0.26 秒 |
+| X-ASR + 热词 | 175MB | 8.3% | 0.35 秒 |
+| X-ASR fp32（未压缩的原版）+ 热词 | 620MB | 7.3% | 0.53 秒 |
+| X-ASR fp32（未压缩的原版） | 620MB | 8.3% | 0.45 秒 |
+| Qwen3-ASR-0.6B + 热词 | 956MB | 9.4% | 2.8 秒 |
+| SenseVoice-Small | 229MB | 13.5% | 0.34 秒 |
+| Fun-ASR-Nano（SenseVoice 格式） | 259MB | 13.5% | 0.34 秒 |
+| FireRedASR2-AED | 1.2GB | 14.6% | 6.6 秒 |
+| Paraformer-zh | 217MB | 15.6% | 0.26 秒 |
+| Qwen3-ASR-0.6B | 956MB | 16.7% | 2.9 秒 |
+| FireRedASR2-CTC | 755MB | 24.0% | 3.3 秒 |
+| Fun-ASR-Nano | 1.0GB | 没跑通 | — |
+
+- X-ASR 的错误率约是 SenseVoice-Small 的一半，速度一样快，体积更小。
+- Qwen3-ASR 和 FireRedASR2 慢 10 到 25 倍，错误率也不更低。
+- X-ASR 只发布了一种大小（0.16B 参数）。fp32 版本和 int8 版本只差一个单位（fp32 把 sign out 听成 sign up，int8 听成「点3幺」），体积是 3.5 倍，耗时多一半，所以用 int8。
+- Fun-ASR-Nano 的 sherpa-onnx 版本最多处理约 25 秒的音频，这段录音被截断了。
+- 「sign out」所有模型都没听对。
+- 只测了一段录音，约 96 个单位。差一两个单位，错误率就差 1 到 2 个百分点，所以表里相邻的几个模型分不出高低。X-ASR 和 SenseVoice-Small 差了 5 个百分点，这个差距可信。
+
 ## 已知限制
 
 - 粘贴后，程序只恢复剪贴板里原来的纯文本。剪贴板里原来是图片或文件时，这些内容会被清掉。
@@ -184,5 +216,3 @@ MR
 代码使用 MIT 许可，见 [LICENSE](LICENSE)。
 
 X-ASR 模型需要单独下载。使用模型时要遵守 [X-ASR 的许可](https://github.com/Gilgamesh-J/X-ASR)。
-
-项目名里的 SenseVoice 是最早用的模型。2026-11-07 起改用 X-ASR：同一段中英混说的录音上，X-ASR 的错误率约是 SenseVoice-Small 的一半。
