@@ -12,6 +12,7 @@ import subprocess
 import sys
 import threading
 import time
+import wave
 from pathlib import Path
 
 import numpy as np
@@ -32,6 +33,7 @@ from Quartz import (
 
 MODEL_DIR = Path(__file__).parent / "models" / "sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17"
 CONFIG = Path(__file__).parent / "config.json"
+RECORDINGS_DIR = Path(__file__).parent / "recordings"  # 这个目录存在时，每段录音都存成 wav，用来比较模型
 LAUNCHD_LABEL = "local.sensevoice-dictation"
 DEFAULT_HOTKEY = 114  # PC 键盘的 Insert 键在 macOS 上发出的是 Help 键的键码 114
 ESC = 53
@@ -139,6 +141,15 @@ def loudest_frame_rms(samples: np.ndarray) -> float:
     frame = SAMPLE_RATE * 30 // 1000
     frames = samples[: len(samples) // frame * frame].reshape(-1, frame)
     return float(np.sqrt((frames**2).mean(axis=1)).max())
+
+
+def save_wav(path: Path, samples: np.ndarray) -> None:
+    with wave.open(str(path), "wb") as w:
+        w.setnchannels(1)
+        w.setsampwidth(2)
+        w.setframerate(SAMPLE_RATE)
+        w.writeframes((np.clip(samples, -1, 1) * 32767).astype(np.int16).tobytes())
+    print(f"已保存 {path}", flush=True)
 
 
 def paste(typer: keyboard.Controller, text: str) -> None:
@@ -319,6 +330,8 @@ def main() -> None:
                 # 没有麦克风权限时 macOS 不报错，只给全零的音频，所以这里要打印出来，否则看不出是权限问题。
                 print(f"(没检测到声音，跳过；最大 RMS {loudest_frame_rms(samples):.4f})", flush=True)
                 continue
+            if RECORDINGS_DIR.is_dir():
+                save_wav(RECORDINGS_DIR / time.strftime("%Y%m%d-%H%M%S.wav"), samples)
             text = transcribe(recognizer, samples)
             print(f"> {text}", flush=True)
             if text:
@@ -329,8 +342,6 @@ if __name__ == "__main__":
     if sys.argv[1:] == ["--set-hotkey"]:
         set_hotkey()
     elif len(sys.argv) == 2:
-        import wave
-
         with wave.open(sys.argv[1]) as w:
             assert w.getframerate() == SAMPLE_RATE and w.getsampwidth() == 2
             pcm = np.frombuffer(w.readframes(w.getnframes()), dtype=np.int16)
