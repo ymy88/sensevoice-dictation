@@ -286,6 +286,10 @@ def main() -> None:
         event = events.get()
         if event == "down" and mic is None:
             chunks.clear()
+            # PortAudio 只在初始化时读一次设备列表。服务启动后才连上的蓝牙耳机、切换过的默认麦克风，
+            # 不重新初始化就用不上，录到的全是 0。2026-11-07 实测重新初始化耗时 2~3ms。
+            sd._terminate()
+            sd._initialize()
             # 麦克风只在按住期间打开，菜单栏的橙色麦克风标志也只在这时出现。
             mic = sd.InputStream(
                 samplerate=SAMPLE_RATE,
@@ -294,7 +298,7 @@ def main() -> None:
                 callback=lambda data, *_: chunks.append(data[:, 0].copy()),
             )
             mic.start()
-            print("录音中…", flush=True)
+            print(f"录音中…（{sd.query_devices(kind='input')['name']}）", flush=True)
         elif event == "cancel" and mic is not None:
             mic.stop()
             mic.close()
