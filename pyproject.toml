@@ -1,7 +1,7 @@
 [project]
 name = "sensevoice-dictation"
 version = "0.1.0"
-description = "Hold Right Option to dictate Chinese/English with SenseVoice-Small, offline"
+description = "Hold a key to dictate Chinese/English with X-ASR, offline"
 requires-python = ">=3.13"
 dependencies = [
     "numpy>=2.5.4",

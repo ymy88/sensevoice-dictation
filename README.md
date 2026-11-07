@@ -1,14 +1,16 @@
 # sensevoice-dictation
 
-在 macOS 上按住一个键说话，松开后文字出现在光标位置。语音识别用 [SenseVoice-Small](https://github.com/FunAudioLLM/SenseVoice) 在本机完成，不联网。
+在 macOS 上按住一个键说话，松开后文字出现在光标位置。语音识别用 [X-ASR](https://github.com/Gilgamesh-J/X-ASR) 在本机完成，不联网。
 
-Hold a key to dictate on macOS. Speech is transcribed locally by SenseVoice-Small. Mixed Chinese and English work well.
+Hold a key to dictate on macOS. Speech is transcribed locally by X-ASR. Mixed Chinese and English work well.
 
 ## 特点
 
 - **中英混说**：「把这个 component 的 props 改成 optional」这类句子，英文单词保持英文。
 - **本地识别**：音频不离开本机。
-- **快**：在 Apple Silicon 上，8 秒的语音识别用时约 0.13 秒。
+- **快**：在 Apple Silicon 上，28 秒的语音识别用时约 0.3 秒。
+- **数字写成阿拉伯数字**：「三八八七」输出成「3887」。
+- **热词**：把常说的技术词写进 `hotwords.txt`，识别会偏向这些词。
 - **任何输入法下都能用**：结果通过剪贴板粘贴，拼音输入法开着时英文也不会被当成拼音。
 - **在任何 App 里都能用**：终端、编辑器、浏览器、聊天软件都可以。
 - **没说话就不输出**：按住快捷键但没说话时，程序跳过识别。
@@ -28,19 +30,26 @@ git clone https://github.com/ymy88/sensevoice-dictation.git
 cd sensevoice-dictation
 uv sync
 
-# 下载模型。压缩包里有 fp32 和 int8 两个版本，程序只用 240MB 的 int8 版本。
+# 下载模型（int8 版本，约 170MB）和数字转换规则
 mkdir -p models && cd models
-curl -LO https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17.tar.bz2
-tar xjf sherpa-onnx-sense-voice-*.tar.bz2 && rm sherpa-onnx-sense-voice-*.tar.bz2
-rm sherpa-onnx-sense-voice-*/model.onnx
+curl -LO https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/sherpa-onnx-x-asr-zipformer-transducer-zh-en-punct-int8-2026-06-03.tar.bz2
+tar xjf sherpa-onnx-x-asr-zipformer-transducer-zh-en-punct-int8-2026-06-03.tar.bz2 && rm sherpa-onnx-x-asr-zipformer-transducer-zh-en-punct-int8-2026-06-03.tar.bz2
+curl -LO https://github.com/k2-fsa/sherpa-onnx/releases/download/asr-models/itn_zh_number.fst
 cd ..
+
+# 生成热词要用的词表 bpe.vocab（不用热词可以跳过）
+uv run --with sentencepiece python -c "
+import sentencepiece as spm
+d = 'models/sherpa-onnx-x-asr-zipformer-transducer-zh-en-punct-int8-2026-06-03/'
+sp = spm.SentencePieceProcessor(model_file=d + 'bpe.model')
+open(d + 'bpe.vocab', 'w').write(''.join(f'{sp.id_to_piece(i)}\t{sp.get_score(i)}\n' for i in range(sp.get_piece_size())))"
 ```
 
 确认模型能用：
 
 ```bash
-uv run python main.py models/sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17/test_wavs/zh.wav
-# 开饭时间早上9点至下午5点。
+uv run python main.py models/sherpa-onnx-x-asr-zipformer-transducer-zh-en-punct-int8-2026-06-03/test_wavs/0.wav
+# 昨天是 Monday, today is 礼拜2， the day after tomorrow 是星期3。
 ```
 
 带一个 wav 文件参数时，程序只识别这个文件并打印结果，不监听键盘。wav 文件必须是 16kHz、16 位。
@@ -127,11 +136,26 @@ uv run python main.py --set-hotkey
 
 改了快捷键的逻辑后，运行 `uv run python test_hotkey.py` 检查。这个测试不会向系统发送按键，也不会动 `config.json` 和后台服务。
 
+## 热词
+
+在项目里建 `hotwords.txt`，一行一个词，比如：
+
+```
+worktree
+session
+cookie
+MR
+```
+
+文件存在时，识别结果会偏向这些词；改完要重启程序或服务。没有这个文件时不用热词。
+
+热词也可能把别的词带偏。2026-11-07 的测试里，热词把 worktree 和 MR 纠正了，但把 Logout 识别成了 Lock。只写确实常说、又常被识别错的词。
+
 ## 怎么工作
 
 1. 程序通过 macOS 的按键事件监听快捷键。按下快捷键时打开麦克风，松开时关闭。麦克风只在按住期间打开。
-2. 录音里最响的 30 毫秒片段，RMS 低于 `SILENCE_RMS` 时，程序认为没人说话，跳过识别。不跳过的话，SenseVoice 会把静音识别成「Okay.」之类的词。
-3. sherpa-onnx 运行 SenseVoice-Small int8 模型，自动判断语言，输出带标点的文字。
+2. 录音里最响的 30 毫秒片段，RMS 低于 `SILENCE_RMS` 时，程序认为没人说话，跳过识别。不跳过的话，模型会把静音识别成「Okay.」之类的词。
+3. sherpa-onnx 运行 X-ASR int8 模型，输出带标点的文字，再按 `itn_zh_number.fst` 把中文数字转成阿拉伯数字。
 4. 程序把文字写进剪贴板，发送 Cmd+V，等 0.3 秒，再把剪贴板恢复成原来的文字。
 
 ## 排查
@@ -152,10 +176,13 @@ uv run python main.py --set-hotkey
 ## 已知限制
 
 - 粘贴后，程序只恢复剪贴板里原来的纯文本。剪贴板里原来是图片或文件时，这些内容会被清掉。
+- 数字转换会把「一个」也转成「1个」。
 - 只支持 macOS。
 
 ## 许可
 
 代码使用 MIT 许可，见 [LICENSE](LICENSE)。
 
-SenseVoice 模型需要单独下载。使用模型时要遵守 [SenseVoice 的模型许可](https://github.com/FunAudioLLM/SenseVoice)。
+X-ASR 模型需要单独下载。使用模型时要遵守 [X-ASR 的许可](https://github.com/Gilgamesh-J/X-ASR)。
+
+项目名里的 SenseVoice 是最早用的模型。2026-11-07 起改用 X-ASR：同一段中英混说的录音上，X-ASR 的错误率约是 SenseVoice-Small 的一半。

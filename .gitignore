@@ -4,3 +4,4 @@ models/
 build/
 config.json
 recordings/
+hotwords.txt

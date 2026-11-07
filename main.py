@@ -1,4 +1,4 @@
-"""按住快捷键说话，松开后用 SenseVoice-Small 在本地识别，把文字打进当前窗口。
+"""按住快捷键说话，松开后用 X-ASR 在本地识别，把文字打进当前窗口。
 
 python main.py               运行
 python main.py --set-hotkey  按一下想用的键，设为快捷键
@@ -31,7 +31,9 @@ from Quartz import (
     kCGKeyboardEventKeycode,
 )
 
-MODEL_DIR = Path(__file__).parent / "models" / "sherpa-onnx-sense-voice-zh-en-ja-ko-yue-2024-07-17"
+MODELS = Path(__file__).parent / "models"
+MODEL_DIR = MODELS / "sherpa-onnx-x-asr-zipformer-transducer-zh-en-punct-int8-2026-06-03"
+HOTWORDS = Path(__file__).parent / "hotwords.txt"  # 一行一个词；文件存在时识别会偏向这些词
 CONFIG = Path(__file__).parent / "config.json"
 RECORDINGS_DIR = Path(__file__).parent / "recordings"  # 这个目录存在时，每段录音都存成 wav，用来比较模型
 LAUNCHD_LABEL = "local.sensevoice-dictation"
@@ -43,7 +45,7 @@ TYPING_KEYS = {36, 48, 49, 51, 76, 117, 123, 124, 125, 126}
 CMD_OR_CONTROL = {54, 55, 59, 62}
 SAMPLE_RATE = 16000
 MIN_SECONDS = 0.3  # 短于这个长度多半是误触，识别出来通常是空串或一个语气词
-# 录音里最响的 30ms 片段的 RMS 低于这个值就当没说话。不跳过的话，SenseVoice 会把静音识别成「Okay.」「.」。
+# 录音里最响的 30ms 片段的 RMS 低于这个值就当没说话。不跳过的话，模型会把静音识别成「Okay.」「.」。
 # 2026-11-07 在 Ghostty + 内置麦克风上实测：环境音最大 0.0012，正常说话中位数 0.05 以上。换麦克风后可能要调。
 SILENCE_RMS = 0.01
 
@@ -121,12 +123,26 @@ def modifier_down(keycode: int, event) -> bool:
 
 
 def make_recognizer() -> sherpa_onnx.OfflineRecognizer:
-    return sherpa_onnx.OfflineRecognizer.from_sense_voice(
-        model=str(MODEL_DIR / "model.int8.onnx"),
+    # 2026-11-07 用同一段 28 秒中英混说的录音比较：X-ASR 加数字转换的错误率 8.3%，SenseVoice-Small 13.5%，
+    # 识别耗时都在 0.3 秒左右。Qwen3-ASR、FireRedASR2 慢 10 倍以上，错误率也不更低。
+    hotwords = {}
+    if HOTWORDS.exists():
+        hotwords = dict(
+            decoding_method="modified_beam_search",  # 热词只在这种解码方式下生效
+            hotwords_file=str(HOTWORDS),
+            hotwords_score=2.0,
+            modeling_unit="cjkchar+bpe",  # 热词里的汉字按字切分，英文按 bpe.vocab 切分
+            bpe_vocab=str(MODEL_DIR / "bpe.vocab"),
+        )
+    return sherpa_onnx.OfflineRecognizer.from_transducer(
+        encoder=str(MODEL_DIR / "encoder-epoch-99-avg-1.int8.onnx"),
+        decoder=str(MODEL_DIR / "decoder-epoch-99-avg-1.onnx"),
+        joiner=str(MODEL_DIR / "joiner-epoch-99-avg-1.int8.onnx"),
         tokens=str(MODEL_DIR / "tokens.txt"),
         num_threads=4,
-        language="auto",
-        use_itn=True,  # 输出标点，数字写成阿拉伯数字
+        # 把「三八八七」转成「3887」。副作用：「一个」也会变成「1个」。
+        rule_fsts=str(MODELS / "itn_zh_number.fst"),
+        **hotwords,
     )
 
 
