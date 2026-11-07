@@ -1,8 +1,8 @@
 """按住 Insert 说话，松开后用 SenseVoice-Small 在本地识别，把文字打进当前窗口。"""
 
+import queue
 import subprocess
 import sys
-import threading
 import time
 from pathlib import Path
 
@@ -51,53 +51,60 @@ def paste(typer: keyboard.Controller, text: str) -> None:
 def main() -> None:
     recognizer = make_recognizer()
     typer = keyboard.Controller()
-    chunks: list[np.ndarray] = []
-    mic: sd.InputStream | None = None
-
-    def on_audio(data: np.ndarray, frames: int, _time, status) -> None:
-        chunks.append(data[:, 0].copy())
-
-    def finish(samples: np.ndarray) -> None:
-        text = transcribe(recognizer, samples)
-        print(f"> {text}", flush=True)
-        if text:
-            paste(typer, text)
+    events: queue.Queue[str] = queue.Queue()
+    held = False
 
     def on_press(key) -> None:
-        nonlocal mic
-        if getattr(key, "vk", None) != HOTKEY_VK or mic is not None:
-            return
-        chunks.clear()
-        # 麦克风只在按住期间打开，菜单栏的橙色麦克风标志也只在这时出现。
-        mic = sd.InputStream(samplerate=SAMPLE_RATE, channels=1, dtype="float32", callback=on_audio)
-        mic.start()
+        nonlocal held
+        if getattr(key, "vk", None) == HOTKEY_VK and not held:  # 按住不放时系统会重复发按下事件
+            held = True
+            events.put("down")
 
     def on_release(key) -> None:
-        nonlocal mic
-        if getattr(key, "vk", None) != HOTKEY_VK or mic is None:
-            return
-        mic.stop()
-        mic.close()
-        mic = None
-        if not chunks:
-            return
-        samples = np.concatenate(chunks)
-        if len(samples) < SAMPLE_RATE * MIN_SECONDS:
-            return
-        # 识别放到别的线程：键盘监听的回调阻塞太久，macOS 会停掉事件监听。
-        threading.Thread(target=finish, args=(samples,), daemon=True).start()
+        nonlocal held
+        if getattr(key, "vk", None) == HOTKEY_VK and held:
+            held = False
+            events.put("up")
 
     def swallow_hotkey(event_type, event):
-        # 回调已经处理过这个按键；这里把它拦下，不让当前 App 收到 Insert（终端会把它转成 ESC [2~）。
+        # 拦下 Insert，不让当前 App 收到（终端会把它转成 ESC [2~）。
         if CGEventGetIntegerValueField(event, kCGKeyboardEventKeycode) == HOTKEY_VK:
             return None
         return event
 
+    # 键盘回调里只做入队。回调阻塞太久（比如打开麦克风时弹出权限框），
+    # macOS 会停用整个按键监听，之后 Insert 既不录音也拦不住。
+    listener = keyboard.Listener(on_press=on_press, on_release=on_release, darwin_intercept=swallow_hotkey)
+    listener.start()
     print("按住 Insert 说话，松开后输出文字。Ctrl+C 退出。", flush=True)
-    with keyboard.Listener(
-        on_press=on_press, on_release=on_release, darwin_intercept=swallow_hotkey
-    ) as listener:
-        listener.join()
+
+    chunks: list[np.ndarray] = []
+    mic: sd.InputStream | None = None
+    while True:
+        event = events.get()
+        if event == "down" and mic is None:
+            chunks.clear()
+            # 麦克风只在按住期间打开，菜单栏的橙色麦克风标志也只在这时出现。
+            mic = sd.InputStream(
+                samplerate=SAMPLE_RATE,
+                channels=1,
+                dtype="float32",
+                callback=lambda data, *_: chunks.append(data[:, 0].copy()),
+            )
+            mic.start()
+        elif event == "up" and mic is not None:
+            mic.stop()
+            mic.close()
+            mic = None
+            if not chunks:
+                continue
+            samples = np.concatenate(chunks)
+            if len(samples) < SAMPLE_RATE * MIN_SECONDS:
+                continue
+            text = transcribe(recognizer, samples)
+            print(f"> {text}", flush=True)
+            if text:
+                paste(typer, text)
 
 
 if __name__ == "__main__":
