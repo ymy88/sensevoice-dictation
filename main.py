@@ -101,14 +101,21 @@ def main() -> None:
                 callback=lambda data, *_: chunks.append(data[:, 0].copy()),
             )
             mic.start()
+            print("录音中…", flush=True)
         elif event == "up" and mic is not None:
             mic.stop()
             mic.close()
             mic = None
+            seconds = sum(len(c) for c in chunks) / SAMPLE_RATE
+            print(f"录到 {seconds:.1f} 秒", flush=True)
             if not chunks:
                 continue
             samples = np.concatenate(chunks)
-            if len(samples) < SAMPLE_RATE * MIN_SECONDS or loudest_frame_rms(samples) < SILENCE_RMS:
+            if len(samples) < SAMPLE_RATE * MIN_SECONDS:
+                continue
+            if loudest_frame_rms(samples) < SILENCE_RMS:
+                # 没有麦克风权限时 macOS 不报错，只给全零的音频，所以这里要打印出来，否则看不出是权限问题。
+                print(f"(没检测到声音，跳过；最大 RMS {loudest_frame_rms(samples):.4f})", flush=True)
                 continue
             text = transcribe(recognizer, samples)
             print(f"> {text}", flush=True)
