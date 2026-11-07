@@ -47,7 +47,10 @@ CMD_OR_CONTROL = {54, 55, 59, 62}
 SAMPLE_RATE = 16000
 # 两个以上、只隔一个空格的单个字母。ponytail: 英文句子里的「a」「I」挨着另一个单字母时也会被合并，需要时改成只合并大写字母。
 SPELLED_LETTERS = re.compile(r"(?<![A-Za-z])[A-Za-z](?: [A-Za-z])+(?![A-Za-z])")
-MIN_SECONDS = 0.3  # 短于这个长度多半是误触，识别出来通常是空串或一个语气词
+# 识别后把这些词换掉，不区分大小写。热词纠正不了的才放这里：Claude 和 cloud 读音几乎一样，
+# 2026-11-07 试过热词，分数调到能纠正时别的句子会整段吞词。
+REPLACEMENTS = {"cloud code": "Claude Code"}
+MIN_SECONDS = 0.3 # 短于这个长度多半是误触，识别出来通常是空串或一个语气词
 # 松开快捷键后再录这么久才关麦克风。蓝牙耳机的声音传到电脑有延迟，松开就关的话最后一个字只录到一半，
 # 2026-11-07 的录音里「推送」被识别成「推销」「退缩」。
 TAIL_SECONDS = 0.3
@@ -163,6 +166,12 @@ def join_spelled_letters(text: str) -> str:
     return SPELLED_LETTERS.sub(lambda m: m.group().replace(" ", ""), text)
 
 
+def replace_words(text: str) -> str:
+    for wrong, right in REPLACEMENTS.items():
+        text = re.sub(rf"\b{re.escape(wrong)}\b", right, text, flags=re.IGNORECASE)
+    return text
+
+
 def split_long(samples: np.ndarray) -> list[np.ndarray]:
     """超过 CHUNK_SECONDS 的录音，在 20 秒到 CHUNK_SECONDS 之间最安静的 30ms 处切开，多半是两句话之间的停顿。"""
     chunks = []
@@ -183,7 +192,7 @@ def transcribe(recognizer: sherpa_onnx.OfflineRecognizer, samples: np.ndarray) -
         recognizer.decode_stream(stream)
         texts.append(stream.result.text.strip())
     # X-ASR 自己在标点后面也加空格，所以段与段之间用空格连接
-    return join_spelled_letters(" ".join(t for t in texts if t))
+    return replace_words(join_spelled_letters(" ".join(t for t in texts if t)))
 
 
 def frame_rms(samples: np.ndarray) -> np.ndarray:

@@ -19,6 +19,16 @@ for raw, expected in CASES.items():
     got = join_spelled_letters(raw)
     assert got == expected, f"{raw!r}: 期望 {expected!r}，实际 {got!r}"
 
+REPLACE_CASES = {
+    "控制我本机的 cloud code 或者": "控制我本机的 Claude Code 或者",
+    "用 Cloud Code 跑": "用 Claude Code 跑",
+    "在 Google Cloud 上": "在 Google Cloud 上",  # 单独的 cloud 不动
+    "icloud code": "icloud code",  # 只换完整的词
+}
+for raw, expected in REPLACE_CASES.items():
+    got = main.replace_words(raw)
+    assert got == expected, f"{raw!r}: 期望 {expected!r}，实际 {got!r}"
+
 # 长录音切段：每段不超过 CHUNK_SECONDS，切点落在停顿里，拼回去和原录音一样
 sec = main.SAMPLE_RATE
 speech = lambda s: np.full(int(s * sec), 0.1, dtype=np.float32)
