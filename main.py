@@ -20,6 +20,7 @@ import sounddevice as sd
 from pynput import keyboard
 from Quartz import (
     CGEventGetFlags,
+    CGEventCreateKeyboardEvent,
     CGEventGetIntegerValueField,
     CGEventKeyboardGetUnicodeString,
     kCGEventFlagsChanged,
@@ -34,8 +35,10 @@ CONFIG = Path(__file__).parent / "config.json"
 LAUNCHD_LABEL = "local.sensevoice-dictation"
 DEFAULT_HOTKEY = 114  # PC 键盘的 Insert 键在 macOS 上发出的是 Help 键的键码 114
 ESC = 53
-# 不产生可打印字符、但打字时常用的键：回车、Tab、删除、小键盘回车、向前删除、方向键
-TYPING_KEYS = {36, 48, 51, 76, 117, 123, 124, 125, 126}
+FN = 63
+# 打字时常用、但不产生可见字符的键：回车、Tab、空格、删除、小键盘回车、向前删除、方向键
+TYPING_KEYS = {36, 48, 49, 51, 76, 117, 123, 124, 125, 126}
+CMD_OR_CONTROL = {54, 55, 59, 62}
 SAMPLE_RATE = 16000
 MIN_SECONDS = 0.3  # 短于这个长度多半是误触，识别出来通常是空串或一个语气词
 # 录音里最响的 30ms 片段的 RMS 低于这个值就当没说话。不跳过的话，SenseVoice 会把静音识别成「Okay.」「.」。
@@ -76,23 +79,39 @@ KEY_NAMES = {
 }
 
 
+def key_char(keycode: int) -> str:
+    """这个键在当前键盘布局下不按修饰键时打出的字符，例如 40 → "K"。不出字符的键返回空串。"""
+    chars = CGEventKeyboardGetUnicodeString(CGEventCreateKeyboardEvent(None, keycode, True), 4, None, None)[1] or ""
+    return chars.upper() if chars.strip() and chars.isprintable() else ""
+
+
 def key_name(keycode: int) -> str:
-    return KEY_NAMES.get(keycode, f"键码 {keycode}")
+    return KEY_NAMES.get(keycode) or key_char(keycode) or f"键码 {keycode}"
 
 
-def key_label(keycode: int) -> str:
-    name = key_name(keycode)
-    return name if name.startswith("键码") else f"{name}（键码 {keycode}）"
+def hotkey_name(keycode: int, modifiers: frozenset[int]) -> str:
+    return "+".join([key_name(m) for m in sorted(modifiers)] + [key_name(keycode)])
 
 
-def load_hotkey() -> int:
+def is_typing_key(keycode: int) -> bool:
+    return keycode in TYPING_KEYS or key_char(keycode) != ""
+
+
+def load_hotkey() -> tuple[int, frozenset[int]]:
     if not CONFIG.exists():
-        return DEFAULT_HOTKEY
-    return int(json.loads(CONFIG.read_text())["keycode"])
+        return DEFAULT_HOTKEY, frozenset()
+    config = json.loads(CONFIG.read_text())
+    return int(config["keycode"]), frozenset(config.get("modifiers", []))
 
 
 def keycode_of(event) -> int:
     return CGEventGetIntegerValueField(event, kCGKeyboardEventKeycode)
+
+
+def held_modifiers(event) -> frozenset[int]:
+    # 不算 Fn：方向键、F 键的按键事件里，系统会自动带上 Fn 标志位。
+    flags = CGEventGetFlags(event)
+    return frozenset(m for m, bit in MODIFIER_BITS.items() if m != FN and flags & bit)
 
 
 def modifier_down(keycode: int, event) -> bool:
@@ -135,37 +154,58 @@ def paste(typer: keyboard.Controller, text: str) -> None:
 
 
 def set_hotkey() -> None:
-    chosen: list[int] = []
+    result: list[tuple[int, frozenset[int]] | None] = []
     done = threading.Event()
+    held: set[int] = set()
+    pressed_together: set[int] = set()  # 这一轮按过的修饰键
+    other_key_pressed = False
 
-    def on_event(event_type, event):
-        keycode = keycode_of(event)
-        pressed = event_type == kCGEventKeyDown or (
-            event_type == kCGEventFlagsChanged and keycode in MODIFIER_BITS and modifier_down(keycode, event)
-        )
-        if not pressed or done.is_set():
-            return event
-        # 非修饰键会被拦下，当前 App 收不到；设成打字要用的键，这个键就再也打不出来了。
-        chars = CGEventKeyboardGetUnicodeString(event, 4, None, None)[1] or ""
-        if event_type == kCGEventKeyDown and keycode != ESC and (
-            keycode in TYPING_KEYS or (chars != "" and chars.isprintable())  # "".isprintable() 也是 True
-        ):
-            shown = f"「{chars}」" if chars.strip() and chars.isprintable() else key_name(keycode)
-            print(f"{shown} 平时打字要用，换一个键。", flush=True)
-            return event
-        chosen.append(keycode)
+    def finish(hotkey: tuple[int, frozenset[int]] | None) -> None:
+        result.append(hotkey)
         done.set()
+
+    # 修饰键要等全部松开才知道是单独按，还是要和别的键组合，所以松开时再记录。
+    def on_event(event_type, event):
+        nonlocal other_key_pressed
+        if done.is_set():
+            return event
+        keycode = keycode_of(event)
+        if event_type == kCGEventFlagsChanged and keycode in MODIFIER_BITS:
+            if modifier_down(keycode, event):
+                held.add(keycode)
+                pressed_together.add(keycode)
+            else:
+                held.discard(keycode)
+                if not held:
+                    if not other_key_pressed and len(pressed_together) == 1:
+                        finish((keycode, frozenset()))
+                    elif not other_key_pressed:
+                        print("同时按了几个修饰键。请单独按一个修饰键，或者按住修饰键再按一个键。", flush=True)
+                    pressed_together.clear()
+                    other_key_pressed = False
+            return event
+        if event_type != kCGEventKeyDown:
+            return event
+        modifiers = frozenset(held - {FN})
+        other_key_pressed = bool(held)
+        if keycode == ESC and not modifiers:
+            finish(None)
+        # 快捷键会被拦下，当前 App 收不到。打字要用的键至少要配 Cmd 或 Control，否则这个键就打不出来了。
+        elif is_typing_key(keycode) and not modifiers & CMD_OR_CONTROL:
+            print(f"{hotkey_name(keycode, modifiers)} 平时打字要用，换一个键，或者加上 Cmd 或 Control。", flush=True)
+        else:
+            finish((keycode, modifiers))
         return event
 
-    print("按一下要用作快捷键的键（Esc 取消）…", flush=True)
+    print("按一下要用作快捷键的键或组合键（Esc 取消）…", flush=True)
     with keyboard.Listener(darwin_intercept=on_event):
         done.wait()
-    keycode = chosen[0]
-    if keycode == ESC:
+    if result[0] is None:
         print("已取消。")
         return
-    CONFIG.write_text(json.dumps({"keycode": keycode}) + "\n")
-    print(f"快捷键设为 {key_label(keycode)}，已写入 {CONFIG}")
+    keycode, modifiers = result[0]
+    CONFIG.write_text(json.dumps({"keycode": keycode, "modifiers": sorted(modifiers)}) + "\n")
+    print(f"快捷键设为 {hotkey_name(keycode, modifiers)}，已写入 {CONFIG}")
     restart = subprocess.run(
         ["launchctl", "kickstart", "-k", f"gui/{os.getuid()}/{LAUNCHD_LABEL}"], capture_output=True
     )
@@ -178,12 +218,13 @@ def set_hotkey() -> None:
 def main() -> None:
     recognizer = make_recognizer()
     typer = keyboard.Controller()
-    hotkey = load_hotkey()
-    is_modifier = hotkey in MODIFIER_BITS
+    hotkey, hotkey_modifiers = load_hotkey()
+    modifier_alone = hotkey in MODIFIER_BITS and not hotkey_modifiers
     my_pid = os.getpid()
     events: queue.Queue[str] = queue.Queue()
     held = False
     cancelled = False
+    swallowing = False  # 快捷键的按下事件被拦了，它的松开事件也要拦
 
     # 这个回调里只做入队。回调阻塞太久（比如打开麦克风时弹出权限框），
     # macOS 会停用整个按键监听，之后快捷键既不录音也拦不住。
@@ -193,16 +234,8 @@ def main() -> None:
             return event  # 自己发的 Cmd+V；快捷键是 Cmd 时不能把它当成按下快捷键
         keycode = keycode_of(event)
 
-        if not is_modifier:
-            if keycode != hotkey:
-                return event
-            if event_type == kCGEventKeyDown and not held:  # 按住不放时系统会重复发按下事件
-                held = True
-                events.put("down")
-            elif event_type == kCGEventKeyUp and held:
-                held = False
-                events.put("up")
-            return None  # 拦下快捷键，不让当前 App 收到（Insert 在终端里会变成 ESC [2~）
+        if not modifier_alone:
+            return on_key_or_combo(event_type, event, keycode)
 
         # 修饰键不拦：拦了的话，这个键和别的键的组合（比如右 Cmd+C）就不能用了。
         # 所以只有单独按住时才录音；按住期间按了别的键，就当是组合键，取消录音。
@@ -220,9 +253,32 @@ def main() -> None:
             events.put("cancel")
         return event
 
+    # 普通键或组合键：按下开始录音，松开其中任意一个键就停止。快捷键会被拦下，当前 App 收不到
+    # （Insert 在终端里会变成 ESC [2~）。
+    def on_key_or_combo(event_type, event, keycode):
+        nonlocal held, swallowing
+        if event_type == kCGEventKeyDown and keycode == hotkey:
+            if held or swallowing:  # 按住不放时系统会重复发按下事件
+                return None
+            if held_modifiers(event) != hotkey_modifiers:
+                return event
+            held = swallowing = True
+            events.put("down")
+            return None
+        if event_type == kCGEventKeyUp and keycode == hotkey and swallowing:
+            swallowing = False
+            if held:
+                held = False
+                events.put("up")
+            return None
+        if event_type == kCGEventFlagsChanged and held and held_modifiers(event) != hotkey_modifiers:
+            held = False  # 先松开了修饰键
+            events.put("up")
+        return event
+
     listener = keyboard.Listener(darwin_intercept=on_event)
     listener.start()
-    print(f"按住 {key_name(hotkey)} 说话，松开后输出文字。Ctrl+C 退出。", flush=True)
+    print(f"按住 {hotkey_name(hotkey, hotkey_modifiers)} 说话，松开后输出文字。Ctrl+C 退出。", flush=True)
 
     chunks: list[np.ndarray] = []
     mic: sd.InputStream | None = None

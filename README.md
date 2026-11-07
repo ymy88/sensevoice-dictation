@@ -102,22 +102,30 @@ launchctl kickstart -k gui/$(id -u)/local.sensevoice-dictation
 uv run python main.py --set-hotkey
 ```
 
-按一下想用的键，程序把它存进项目里的 `config.json`，后台服务在运行的话会自动重启。按 Esc 取消。没有 `config.json` 时用 Insert。
+按下想用的键或组合键，再全部松开。程序把它存进项目里的 `config.json`，后台服务在运行的话会自动重启。按 Esc 取消。没有 `config.json` 时用 Insert。
 
-可以用两类键：
+可以用三类快捷键：
 
-- **功能键**：Insert、F13 到 F19 等。程序会拦下这个键，当前 App 收不到它。
-- **修饰键**：右 Option、右 Cmd、右 Control、右 Shift、Fn，左边的也可以。Mac 键盘没有 Insert，推荐用右 Option 或右 Cmd。
+| 类型 | 例子 | 录音规则 |
+|---|---|---|
+| 单个功能键 | Insert、F13 到 F19 | 按住时录音，松开后识别。程序会拦下这个键，当前 App 收不到它。 |
+| 单个修饰键 | 右 Option、右 Cmd、右 Control、右 Shift、Fn，左边的也可以 | 单独按住时录音，松开后识别。按住期间又按了别的键，程序当作组合键，取消这次录音。 |
+| 修饰键 + 一个键 | 右 Control+K、Cmd+Shift+K | 按下组合键时开始录音，松开其中任意一个键就停止。程序会拦下这个组合键，当前 App 收不到它。 |
 
-修饰键不会被拦下，因为拦下后，这个键的组合键（比如右 Cmd+C）就不能用了。所以修饰键的规则是：
-
-- 单独按住时录音，松开后识别。
-- 按住期间又按了别的键，程序当作组合键，取消这次录音。
+- 左右两边的修饰键是分开的：设成右 Control+K 后，左 Control+K 不触发。
+- 组合键要完全一致：设成右 Control+K 后，右 Control+右 Shift+K 不触发。
+- 单个修饰键不会被拦下。拦下后，这个键的组合键（比如右 Cmd+C）就不能用了。
 - 快速按一下（短于 0.3 秒）不识别。
+- Mac 键盘没有 Insert，推荐用右 Option 或右 Cmd。
 
-字母、数字、符号、空格、回车、Tab、删除和方向键不能设为快捷键，程序会提示换一个键。
+下面这些键会被拒绝，程序会提示换一个：
+
+- 单独的字母、数字、符号、空格、回车、Tab、删除和方向键。
+- 只配了 Shift 或 Option 的上面这些键，比如 Shift+A。这些组合平时用来打大写字母和特殊符号。配了 Cmd 或 Control 就可以，比如 Control+K。
 
 用 Fn 时，先在「系统设置 → 键盘」里把「按下 🌐 键时」设为「无操作」。否则每次按住 Fn，macOS 还会弹出表情面板或切换输入法。
+
+改了快捷键的逻辑后，运行 `uv run python test_hotkey.py` 检查。这个测试不会向系统发送按键，也不会动 `config.json` 和后台服务。
 
 ## 怎么工作
 
