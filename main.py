@@ -17,6 +17,9 @@ MODEL_DIR = Path(__file__).parent / "models" / "sherpa-onnx-sense-voice-zh-en-ja
 HOTKEY_VK = 114
 SAMPLE_RATE = 16000
 MIN_SECONDS = 0.3  # 短于这个长度多半是误触，识别出来通常是空串或一个语气词
+# 录音里最响的 30ms 片段的 RMS 低于这个值就当没说话。不跳过的话，SenseVoice 会把静音识别成「Okay.」「.」。
+# 2026-11-07 在 Ghostty + 内置麦克风上实测：环境音最大 0.0012，正常说话中位数 0.05 以上。换麦克风后可能要调。
+SILENCE_RMS = 0.01
 
 
 def make_recognizer() -> sherpa_onnx.OfflineRecognizer:
@@ -34,6 +37,12 @@ def transcribe(recognizer: sherpa_onnx.OfflineRecognizer, samples: np.ndarray) -
     stream.accept_waveform(SAMPLE_RATE, samples)
     recognizer.decode_stream(stream)
     return stream.result.text.strip()
+
+
+def loudest_frame_rms(samples: np.ndarray) -> float:
+    frame = SAMPLE_RATE * 30 // 1000
+    frames = samples[: len(samples) // frame * frame].reshape(-1, frame)
+    return float(np.sqrt((frames**2).mean(axis=1)).max())
 
 
 def paste(typer: keyboard.Controller, text: str) -> None:
@@ -99,7 +108,7 @@ def main() -> None:
             if not chunks:
                 continue
             samples = np.concatenate(chunks)
-            if len(samples) < SAMPLE_RATE * MIN_SECONDS:
+            if len(samples) < SAMPLE_RATE * MIN_SECONDS or loudest_frame_rms(samples) < SILENCE_RMS:
                 continue
             text = transcribe(recognizer, samples)
             print(f"> {text}", flush=True)
