@@ -54,6 +54,9 @@ TAIL_SECONDS = 0.3
 # 识别前在录音末尾补这么长的静音。X-ASR 认一个字时要用到这个字后面的声音，结尾没有静音时最后一个字常被丢掉。
 # 2026-11-07 用 42 段录音测：不补时「GPU」常变成「gp」；补 0.3 秒能认出来，补 0.5 秒有时会在结尾多出一个词。
 PAD_SECONDS = 0.3
+# X-ASR 一次最多处理 4000 帧（40 秒，含补的静音），再长就报错。更长的录音切成不超过这个长度的几段分别识别。
+CHUNK_SECONDS = 30
+FRAME = SAMPLE_RATE * 30 // 1000  # 30ms，算音量用的片段长度
 # 录音里最响的 30ms 片段的 RMS 低于这个值就当没说话。不跳过的话，模型会把静音识别成「Okay.」「.」。
 # 2026-11-07 在 Ghostty + 内置麦克风上实测：环境音最大 0.0012，正常说话中位数 0.05 以上。换麦克风后可能要调。
 SILENCE_RMS = 0.01
@@ -160,18 +163,37 @@ def join_spelled_letters(text: str) -> str:
     return SPELLED_LETTERS.sub(lambda m: m.group().replace(" ", ""), text)
 
 
+def split_long(samples: np.ndarray) -> list[np.ndarray]:
+    """超过 CHUNK_SECONDS 的录音，在 20 秒到 CHUNK_SECONDS 之间最安静的 30ms 处切开，多半是两句话之间的停顿。"""
+    chunks = []
+    while len(samples) > SAMPLE_RATE * CHUNK_SECONDS:
+        start = SAMPLE_RATE * 20
+        cut = start + int(frame_rms(samples[start : SAMPLE_RATE * CHUNK_SECONDS]).argmin()) * FRAME + FRAME // 2
+        chunks.append(samples[:cut])
+        samples = samples[cut:]
+    return chunks + [samples]
+
+
 def transcribe(recognizer: sherpa_onnx.OfflineRecognizer, samples: np.ndarray) -> str:
-    stream = recognizer.create_stream()
     padding = np.zeros(int(SAMPLE_RATE * PAD_SECONDS), dtype=np.float32)
-    stream.accept_waveform(SAMPLE_RATE, np.concatenate([samples, padding]))
-    recognizer.decode_stream(stream)
-    return join_spelled_letters(stream.result.text.strip())
+    texts = []
+    for chunk in split_long(samples):
+        stream = recognizer.create_stream()
+        stream.accept_waveform(SAMPLE_RATE, np.concatenate([chunk, padding]))
+        recognizer.decode_stream(stream)
+        texts.append(stream.result.text.strip())
+    # X-ASR 自己在标点后面也加空格，所以段与段之间用空格连接
+    return join_spelled_letters(" ".join(t for t in texts if t))
+
+
+def frame_rms(samples: np.ndarray) -> np.ndarray:
+    """每个 30ms 片段的 RMS。"""
+    frames = samples[: len(samples) // FRAME * FRAME].reshape(-1, FRAME)
+    return np.sqrt((frames**2).mean(axis=1))
 
 
 def loudest_frame_rms(samples: np.ndarray) -> float:
-    frame = SAMPLE_RATE * 30 // 1000
-    frames = samples[: len(samples) // frame * frame].reshape(-1, frame)
-    return float(np.sqrt((frames**2).mean(axis=1)).max())
+    return float(frame_rms(samples).max())
 
 
 def save_wav(path: Path, samples: np.ndarray) -> None:
