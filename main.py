@@ -8,6 +8,7 @@ python main.py some.wav      只识别一个 wav 文件（自检）
 import json
 import os
 import queue
+import re
 import subprocess
 import sys
 import threading
@@ -44,6 +45,8 @@ FN = 63
 TYPING_KEYS = {36, 48, 49, 51, 76, 117, 123, 124, 125, 126}
 CMD_OR_CONTROL = {54, 55, 59, 62}
 SAMPLE_RATE = 16000
+# 两个以上、只隔一个空格的单个字母。ponytail: 英文句子里的「a」「I」挨着另一个单字母时也会被合并，需要时改成只合并大写字母。
+SPELLED_LETTERS = re.compile(r"(?<![A-Za-z])[A-Za-z](?: [A-Za-z])+(?![A-Za-z])")
 MIN_SECONDS = 0.3  # 短于这个长度多半是误触，识别出来通常是空串或一个语气词
 # 录音里最响的 30ms 片段的 RMS 低于这个值就当没说话。不跳过的话，模型会把静音识别成「Okay.」「.」。
 # 2026-11-07 在 Ghostty + 内置麦克风上实测：环境音最大 0.0012，正常说话中位数 0.05 以上。换麦克风后可能要调。
@@ -146,11 +149,16 @@ def make_recognizer() -> sherpa_onnx.OfflineRecognizer:
     )
 
 
+def join_spelled_letters(text: str) -> str:
+    """把逐个字母读出的词合并：X-ASR 把「GPU」输出成「G P U」。"""
+    return SPELLED_LETTERS.sub(lambda m: m.group().replace(" ", ""), text)
+
+
 def transcribe(recognizer: sherpa_onnx.OfflineRecognizer, samples: np.ndarray) -> str:
     stream = recognizer.create_stream()
     stream.accept_waveform(SAMPLE_RATE, samples)
     recognizer.decode_stream(stream)
-    return stream.result.text.strip()
+    return join_spelled_letters(stream.result.text.strip())
 
 
 def loudest_frame_rms(samples: np.ndarray) -> float:
