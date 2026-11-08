@@ -205,6 +205,29 @@ def loudest_frame_rms(samples: np.ndarray) -> float:
     return float(frame_rms(samples).max())
 
 
+def lid_closed() -> bool:
+    out = subprocess.run(["ioreg", "-r", "-k", "AppleClamshellState", "-d", "1"], capture_output=True, text=True).stdout
+    return '"AppleClamshellState" = Yes' in out
+
+
+def fallback_input(devices) -> int | None:
+    """MacBook 合盖后自带麦克风只给全零，换一个能用的麦克风。跳过 iPhone 的麦克风（会去开手机的麦克风），
+    也跳过同时有输出的设备（Zoom 之类的虚拟设备是这样；蓝牙耳机、USB 麦克风的输入是单独一个设备）。
+    ponytail: 按名字和声道数猜，有多个外接麦克风时取第一个；需要时改成在 config.json 里指定设备名。"""
+    for d in devices:
+        if d["max_input_channels"] and not d["max_output_channels"] and not re.search("MacBook|iPhone", d["name"]):
+            return d["index"]
+    return None
+
+
+def pick_input() -> int | None:
+    """要用的麦克风；None 表示用系统默认输入设备。2026-11-08 耳机重连后 macOS 没把输入切回耳机，
+    默认输入还是合着盖的自带麦克风，录到的全是 0。"""
+    if "MacBook" not in sd.query_devices(kind="input")["name"] or not lid_closed():
+        return None
+    return fallback_input(sd.query_devices())
+
+
 def save_wav(path: Path, samples: np.ndarray) -> None:
     with wave.open(str(path), "wb") as w:
         w.setnchannels(1)
@@ -363,15 +386,17 @@ def main() -> None:
             # 不重新初始化就用不上，录到的全是 0。2026-11-07 实测重新初始化耗时 2~3ms。
             sd._terminate()
             sd._initialize()
+            device = pick_input()
             # 麦克风只在按住期间打开，菜单栏的橙色麦克风标志也只在这时出现。
             mic = sd.InputStream(
+                device=device,
                 samplerate=SAMPLE_RATE,
                 channels=1,
                 dtype="float32",
                 callback=lambda data, *_: chunks.append(data[:, 0].copy()),
             )
             mic.start()
-            print(f"录音中…（{sd.query_devices(kind='input')['name']}）", flush=True)
+            print(f"录音中…（{sd.query_devices(device, kind='input')['name']}）", flush=True)
         elif event == "cancel" and mic is not None:
             mic.stop()
             mic.close()
