@@ -9,6 +9,7 @@ import json
 import os
 import queue
 import re
+import signal
 import subprocess
 import sys
 import threading
@@ -16,10 +17,12 @@ import time
 import wave
 from pathlib import Path
 
+import AppKit
 import numpy as np
 import sherpa_onnx
 import sounddevice as sd
 from pynput import keyboard
+from PyObjCTools import AppHelper
 from Quartz import (
     CGEventGetFlags,
     CGEventCreateKeyboardEvent,
@@ -63,6 +66,9 @@ FRAME = SAMPLE_RATE * 30 // 1000  # 30ms，算音量用的片段长度
 # 录音里最响的 30ms 片段的 RMS 低于这个值就当没说话。不跳过的话，模型会把静音识别成「Okay.」「.」。
 # 2026-11-07 在 Ghostty + 内置麦克风上实测：环境音最大 0.0012，正常说话中位数 0.05 以上。换麦克风后可能要调。
 SILENCE_RMS = 0.01
+# 菜单栏图标下方提示框的大小（点）
+HINT_WIDTH = 120
+HINT_HEIGHT = 30
 
 # 修饰键的键码 → 事件标志位里表示「这个键按着」的位。
 # 左右两边的同名键共用一个通用标志位，所以用区分左右的设备标志位（IOKit 的 NX_DEVICE*KEYMASK）。
@@ -311,6 +317,172 @@ def set_hotkey() -> None:
         print("没有找到后台服务。如果在前台运行 main.py，重新启动它即可。")
 
 
+class LevelBars(AppKit.NSView):
+    """跟着说话音量跳的三根竖条，用来看出麦克风真的收到了声音。没声音时只剩最短的一截。"""
+
+    def drawRect_(self, rect):
+        AppKit.NSColor.labelColor().set()  # 跟着明暗模式变，在浅色背景上是深色
+        for i, factor in enumerate((0.6, 1.0, 0.75)):
+            height = 3 + 13 * min(1.0, self.level * factor)
+            bar = AppKit.NSMakeRect(i * 8.0, (16 - height) / 2, 4.0, height)
+            AppKit.NSBezierPath.bezierPathWithRoundedRect_xRadius_yRadius_(bar, 2.0, 2.0).fill()
+
+
+class ClickHandler(AppKit.NSObject):
+    """菜单栏按钮的 target。按钮的动作只能由 Objective-C 对象接收，这里转给 Python 函数。"""
+
+    def click_(self, _sender) -> None:
+        self.on_click()
+
+
+class MenuBar:
+    """菜单栏图标。程序在跑就一直显示；按住快捷键时图标换成实心的，并在图标下方弹出提示。
+    画界面必须在主线程，所以公开方法都用 AppHelper.callAfter 转过去，调用方不用管线程。
+    点一下图标等于按下快捷键，再点一下等于松开——键盘监听被系统拦住时用这个。"""
+
+    def __init__(self, events: queue.Queue[str]) -> None:
+        self.events = events
+        self.app = AppKit.NSApplication.sharedApplication()
+        self.app.setActivationPolicy_(AppKit.NSApplicationActivationPolicyAccessory)  # 只占菜单栏，不进 Dock 和 Cmd+Tab
+        self.item = AppKit.NSStatusBar.systemStatusBar().statusItemWithLength_(AppKit.NSVariableStatusItemLength)
+
+        self.hint = AppKit.NSWindow.alloc().initWithContentRect_styleMask_backing_defer_(
+            AppKit.NSMakeRect(0, 0, HINT_WIDTH, HINT_HEIGHT),
+            AppKit.NSWindowStyleMaskBorderless,  # 无边框、不能成为主窗口，所以不会抢走键盘焦点
+            AppKit.NSBackingStoreBuffered,
+            False,
+        )
+        self.hint.setLevel_(AppKit.NSStatusWindowLevel)  # 盖在全屏 App 上面
+        self.hint.setIgnoresMouseEvents_(True)
+        self.hint.setOpaque_(False)
+        self.hint.setBackgroundColor_(AppKit.NSColor.clearColor())
+        self.hint.setReleasedWhenClosed_(False)
+        self.hint.setHidesOnDeactivate_(False)
+        bubble = AppKit.NSVisualEffectView.alloc().initWithFrame_(AppKit.NSMakeRect(0, 0, HINT_WIDTH, HINT_HEIGHT))
+        bubble.setMaterial_(AppKit.NSVisualEffectMaterialHUDWindow)
+        bubble.setWantsLayer_(True)
+        bubble.layer().setCornerRadius_(HINT_HEIGHT / 2)
+        bubble.layer().setMasksToBounds_(True)
+        label = AppKit.NSTextField.labelWithString_("正在听写")
+        label.setFrame_(AppKit.NSMakeRect(0, (HINT_HEIGHT - 16) / 2, 69, 16))
+        label.setAlignment_(AppKit.NSTextAlignmentRight)
+        label.setFont_(AppKit.NSFont.systemFontOfSize_(12))
+        label.setTextColor_(AppKit.NSColor.labelColor())
+        bubble.addSubview_(label)
+        self.bars = LevelBars.alloc().initWithFrame_(AppKit.NSMakeRect(75, (HINT_HEIGHT - 16) / 2, 24, 16))
+        self.bars.level = 0.0  # 0~1，由录音回调更新
+        bubble.addSubview_(self.bars)
+        self.hint.setContentView_(bubble)
+        self.level = 0.0
+        AppKit.NSTimer.scheduledTimerWithTimeInterval_repeats_block_(0.033, True, self._tick)
+
+        # 不给菜单，直接挂动作：点一下就切换录音状态。按钮只弱引用 target，所以要留个强引用。
+        self.clicker = ClickHandler.alloc().init()
+        self.clicker.on_click = lambda: events.put("toggle")
+        self.item.button().setTarget_(self.clicker)
+        self.item.button().setAction_("click:")
+
+        self.set_recording(False)
+
+    def set_level(self, level: float) -> None:
+        """录音回调里调用，传这一小块音频的 RMS。说话时 RMS 中位数 0.05 左右，乘 12 后接近满格。"""
+        self.level = min(1.0, level * 12)
+
+    def _tick(self, _timer) -> None:
+        if not self.hint.isVisible():
+            return
+        # 取「这一帧的音量」和「上一帧的 80%」里大的那个，字与字之间的间隙里竖条不会一帧掉到底
+        level = max(self.level, self.bars.level * 0.8)
+        if level != self.bars.level:
+            self.bars.level = level
+            self.bars.setNeedsDisplay_(True)
+
+    def set_recording(self, on: bool) -> None:
+        AppHelper.callAfter(self._set_recording, on)
+
+    def _set_recording(self, on: bool) -> None:
+        icon = AppKit.NSImage.imageWithSystemSymbolName_accessibilityDescription_("mic.fill" if on else "mic", None)
+        icon.setTemplate_(True)  # 跟随菜单栏深浅色
+        self.item.button().setImage_(icon)
+        if on:
+            self._place_under_icon()
+            self.hint.orderFront_(None)
+        else:
+            self.hint.orderOut_(None)
+
+    def _place_under_icon(self) -> None:
+        button = self.item.button()
+        frame = button.window().convertRectToScreen_(button.convertRect_toView_(button.bounds(), None))
+        # 屏幕坐标原点在左下角，图标下方就是 y 更小的一侧。状态栏窗口比图标本身高一点，留 6 点空隙。
+        x = frame.origin.x + (frame.size.width - HINT_WIDTH) / 2
+        y = frame.origin.y - HINT_HEIGHT - 6
+        self.hint.setFrameOrigin_((x, y))
+
+
+def dictate(
+    recognizer: sherpa_onnx.OfflineRecognizer, typer: keyboard.Controller, events: queue.Queue[str], menubar: MenuBar
+) -> None:
+    """处理按键线程发来的事件。跑在主线程之外：主线程留给菜单栏的 run loop。"""
+    chunks: list[np.ndarray] = []
+    mic: sd.InputStream | None = None
+    while True:
+        event = events.get()
+        if event == "toggle":  # 点击图标：麦克风开着就是结束，否则就是开始
+            event = "down" if mic is None else "up"
+        if event == "down" and mic is None:
+            menubar.set_recording(True)
+            chunks.clear()
+            # PortAudio 只在初始化时读一次设备列表。服务启动后才连上的蓝牙耳机、切换过的默认麦克风，
+            # 不重新初始化就用不上，录到的全是 0。2026-11-07 实测重新初始化耗时 2~3ms。
+            sd._terminate()
+            sd._initialize()
+            device = pick_input()
+            # 麦克风只在按住期间打开，菜单栏的橙色麦克风标志也只在这时出现。
+            def on_audio(data, *_) -> None:
+                block = data[:, 0].copy()
+                chunks.append(block)
+                menubar.set_level(float(np.sqrt((block**2).mean())))
+
+            mic = sd.InputStream(
+                device=device,
+                samplerate=SAMPLE_RATE,
+                channels=1,
+                dtype="float32",
+                callback=on_audio,
+            )
+            mic.start()
+            print(f"录音中…（{sd.query_devices(device, kind='input')['name']}）", flush=True)
+        elif event == "cancel" and mic is not None:
+            menubar.set_recording(False)
+            mic.stop()
+            mic.close()
+            mic = None
+            print("按了组合键，取消录音", flush=True)
+        elif event == "up" and mic is not None:
+            time.sleep(TAIL_SECONDS)
+            mic.stop()
+            mic.close()
+            mic = None
+            menubar.set_recording(False)
+            seconds = sum(len(c) for c in chunks) / SAMPLE_RATE
+            print(f"录到 {seconds:.1f} 秒", flush=True)
+            if not chunks:
+                continue
+            samples = np.concatenate(chunks)
+            if len(samples) < SAMPLE_RATE * MIN_SECONDS:
+                continue
+            if loudest_frame_rms(samples) < SILENCE_RMS:
+                # 没有麦克风权限时 macOS 不报错，只给全零的音频，所以这里要打印出来，否则看不出是权限问题。
+                print(f"(没检测到声音，跳过；最大 RMS {loudest_frame_rms(samples):.4f})", flush=True)
+                continue
+            if RECORDINGS_DIR.is_dir():
+                save_wav(RECORDINGS_DIR / time.strftime("%Y%m%d-%H%M%S.wav"), samples)
+            text = transcribe(recognizer, samples)
+            print(f"> {text}", flush=True)
+            if text:
+                paste(typer, text)
+
+
 def main() -> None:
     recognizer = make_recognizer()
     typer = keyboard.Controller()
@@ -376,54 +548,18 @@ def main() -> None:
     listener.start()
     print(f"按住 {hotkey_name(hotkey, hotkey_modifiers)} 说话，松开后输出文字。Ctrl+C 退出。", flush=True)
 
-    chunks: list[np.ndarray] = []
-    mic: sd.InputStream | None = None
-    while True:
-        event = events.get()
-        if event == "down" and mic is None:
-            chunks.clear()
-            # PortAudio 只在初始化时读一次设备列表。服务启动后才连上的蓝牙耳机、切换过的默认麦克风，
-            # 不重新初始化就用不上，录到的全是 0。2026-11-07 实测重新初始化耗时 2~3ms。
-            sd._terminate()
-            sd._initialize()
-            device = pick_input()
-            # 麦克风只在按住期间打开，菜单栏的橙色麦克风标志也只在这时出现。
-            mic = sd.InputStream(
-                device=device,
-                samplerate=SAMPLE_RATE,
-                channels=1,
-                dtype="float32",
-                callback=lambda data, *_: chunks.append(data[:, 0].copy()),
-            )
-            mic.start()
-            print(f"录音中…（{sd.query_devices(device, kind='input')['name']}）", flush=True)
-        elif event == "cancel" and mic is not None:
-            mic.stop()
-            mic.close()
-            mic = None
-            print("按了组合键，取消录音", flush=True)
-        elif event == "up" and mic is not None:
-            time.sleep(TAIL_SECONDS)
-            mic.stop()
-            mic.close()
-            mic = None
-            seconds = sum(len(c) for c in chunks) / SAMPLE_RATE
-            print(f"录到 {seconds:.1f} 秒", flush=True)
-            if not chunks:
-                continue
-            samples = np.concatenate(chunks)
-            if len(samples) < SAMPLE_RATE * MIN_SECONDS:
-                continue
-            if loudest_frame_rms(samples) < SILENCE_RMS:
-                # 没有麦克风权限时 macOS 不报错，只给全零的音频，所以这里要打印出来，否则看不出是权限问题。
-                print(f"(没检测到声音，跳过；最大 RMS {loudest_frame_rms(samples):.4f})", flush=True)
-                continue
-            if RECORDINGS_DIR.is_dir():
-                save_wav(RECORDINGS_DIR / time.strftime("%Y%m%d-%H%M%S.wav"), samples)
-            text = transcribe(recognizer, samples)
-            print(f"> {text}", flush=True)
-            if text:
-                paste(typer, text)
+    menubar = MenuBar(events)
+    # 菜单栏的 run loop 在 C 里跑，Python 的信号处理函数平时轮不到执行，定时器让它每 0.2 秒回到解释器一次。
+    interrupted = threading.Event()
+    signal.signal(signal.SIGINT, lambda *_: interrupted.set())
+
+    def check_interrupt(_timer) -> None:
+        if interrupted.is_set():
+            menubar.app.terminate_(None)  # stop_ 停不掉这个 run loop
+
+    AppKit.NSTimer.scheduledTimerWithTimeInterval_repeats_block_(0.2, True, check_interrupt)
+    threading.Thread(target=dictate, args=(recognizer, typer, events, menubar), daemon=True).start()
+    menubar.app.run()  # 菜单栏图标和提示框要主线程的 run loop 才画得出来
 
 
 if __name__ == "__main__":
